@@ -41,7 +41,9 @@ HTML = """
         <th>t</th><th>RPM</th><th>TPS %</th><th>Speed</th><th>Load %</th>
         <th>MAF g/s</th><th>Adv °</th><th>IAT °C</th>
         <th>STFT1 %</th><th>LTFT1 %</th><th>STFT2 %</th><th>LTFT2 %</th>
-        <th>Cmd λ</th><th>Cmd AFR</th><th>AFR</th><th>λ</th><th>WB V</th><th>Fuel</th><th>ACIS</th>
+        <th>Cmd λ</th><th>Cmd AFR</th><th>AFR</th><th>λ</th><th>WB V</th>
+        <th>MPG inst</th><th>MPG avg</th>
+        <th>Fuel</th><th>ACIS</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -55,10 +57,22 @@ async function refresh() {
   document.getElementById('proto').textContent = j.protocol ? "("+j.protocol+")" : "";
   const c = document.getElementById('cards'); c.innerHTML = "";
   const fields = [
-    ['RPM', j.rpm], ['TPS %', j.throttle_pos], ['Speed mph', j.speed], ['Load %', j.load],
-    ['MAF g/s', j.maf], ['Timing °', j.timing_advance], ['IAT °C', j.iat],
-    ['Cmd λ', j.lmbd_cmd], ['Cmd AFR', j.afr_cmd], ['AFR', j.afr], ['Lambda', j.lmbd],
-    ['WB Volts', j.wb_volts], ['Fuel', j.fuel_status], ['ACIS est', j.acis_est?'ON':'OFF']
+    ['RPM', j.rpm],
+    ['TPS %', j.throttle_pos],
+    ['Speed mph', j.speed],
+    ['Load %', j.load],
+    ['MAF g/s', j.maf],
+    ['Timing °', j.timing_advance],
+    ['IAT °C', j.iat],
+    ['Cmd λ', j.lmbd_cmd],
+    ['Cmd AFR', j.afr_cmd],
+    ['AFR', j.afr],
+    ['Lambda', j.lmbd],
+    ['WB Volts', j.wb_volts],
+    ['MPG inst', j.mpg_inst],
+    ['MPG avg', j.mpg_avg],
+    ['Fuel', j.fuel_status],
+    ['ACIS est', j.acis_est ? 'ON' : 'OFF']
   ];
   for (const [k,v] of fields) {
     const div = document.createElement('div'); div.className='card';
@@ -73,6 +87,7 @@ async function refresh() {
       `<td>${fmt(row.maf)}</td><td>${fmt(row.timing_advance)}</td><td>${fmt(row.iat)}</td>` +
       `<td>${fmt(row.stft1)}</td><td>${fmt(row.ltft1)}</td><td>${fmt(row.stft2)}</td><td>${fmt(row.ltft2)}</td>` +
       `<td>${fmt(row.lmbd_cmd)}</td><td>${fmt(row.afr_cmd)}</td><td>${fmt(row.afr)}</td><td>${fmt(row.lmbd)}</td><td>${fmt(row.wb_volts)}</td>` +
+      `<td>${fmt(row.mpg_inst)}</td><td>${fmt(row.mpg_avg)}</td>` +
       `<td>${row.fuel_status ?? '—'}</td><td>${row.acis_est ? 'ON' : 'OFF'}</td>`;
     rows.appendChild(tr);
   });
@@ -105,6 +120,8 @@ PIDS = {
 }
 
 STOICH_AFR = 14.7
+# Approximate gasoline mass per gallon [grams/gal]
+GASOLINE_GPG = 2810.0
 
 # --- Wideband AFR reader via ADS1115 ---
 class AfrReader:
@@ -204,7 +221,12 @@ class Logger:
         self.acis_rpm_thresh = acis_rpm_thresh
         self.acis_tps_thresh = acis_tps_thresh
 
-        fields = ['t'] + list(PIDS.keys()) + ['afr_cmd','afr','lmbd','wb_volts','fuel_status','acis_est']
+        # MPG integration state
+        self._last_ts = None
+        self.total_dist_mi = 0.0
+        self.total_fuel_gal = 0.0
+
+        fields = ['t'] + list(PIDS.keys()) + ['afr_cmd','afr','lmbd','wb_volts','fuel_status','acis_est','mpg_inst','mpg_avg']
         if csv_path:
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
             self.csv_file = open(csv_path, 'w', newline='')
@@ -250,7 +272,7 @@ class Logger:
         else:
             for k in PIDS.keys():
                 row[k] = None
-            row["afr_cmd"], row["fuel_status"] = None, None
+            row["afr_cmd"], row["fuel_status"], row["lmbd_cmd"] = None, None, None
 
         # Wideband AFR
         wb_v, afr = (None,None)
@@ -267,6 +289,44 @@ class Logger:
             if (rpm >= self.acis_rpm_thresh) and (tps >= self.acis_tps_thresh):
                 acis_on = True
         row["acis_est"] = acis_on
+
+        # MPG calculations (instantaneous + running average)
+        mpg_inst, mpg_avg = None, None
+        speed_mph = row.get("speed")
+        maf_gps = row.get("maf")  # grams per second
+        # Effective AFR: prefer actual AFR, then commanded, then stoich
+        afr_effective = None
+        if row.get("afr") is not None and row["afr"] > 0:
+            afr_effective = row["afr"]
+        elif row.get("afr_cmd") is not None and row["afr_cmd"] > 0:
+            afr_effective = row["afr_cmd"]
+        else:
+            afr_effective = STOICH_AFR
+
+        if self._last_ts is not None and speed_mph is not None and maf_gps is not None and afr_effective and afr_effective > 0:
+            dt = now - self._last_ts
+            if dt > 0:
+                # Fuel mass flow [g/s] -> [gal/s] -> [gal]
+                fuel_gps = maf_gps / afr_effective    # g/s fuel
+                fuel_gal = fuel_gps * dt / GASOLINE_GPG
+
+                # Distance [mi] over dt
+                dist_mi = speed_mph * dt / 3600.0
+
+                # Instantaneous MPG (based on current flow + speed)
+                fuel_gph = fuel_gps * 3600.0 / GASOLINE_GPG if fuel_gps > 0 else None
+                if fuel_gph and fuel_gph > 0 and speed_mph > 1.0:
+                    mpg_inst = speed_mph / fuel_gph
+
+                # Accumulate for running average
+                self.total_dist_mi += dist_mi
+                self.total_fuel_gal += fuel_gal
+                if self.total_fuel_gal > 0:
+                    mpg_avg = self.total_dist_mi / self.total_fuel_gal
+
+        self._last_ts = now
+        row["mpg_inst"] = mpg_inst
+        row["mpg_avg"] = mpg_avg
 
         with self.lock:
             self.latest = row
@@ -306,7 +366,7 @@ def api_latest():
 
 def main():
     parser = argparse.ArgumentParser(description="Tundra Pi Tuner — OBD + AFR + VVT-i context")
-    parser.add_argument('--port', help='ELM327 port, e.g. /dev/ttyUSB0')
+    parser.add_argument('--port', help='ELM327 port, e.g. /dev/ttyUSB0 or COM3')
     parser.add_argument('--baud', type=int, help='ELM327 baudrate (usually auto)')
     parser.add_argument('--hz', type=float, default=2.0, help='Sample rate (Hz)')
     parser.add_argument('--csv', help='CSV log path (optional)')
